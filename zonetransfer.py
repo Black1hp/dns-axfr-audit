@@ -1,213 +1,162 @@
-import argparse
-import dns.resolver
-import dns.zone
-import dns.query
-import threading
-import time
-import os
-from datetime import datetime
-from queue import Queue
-
-# Author: Black1hp
-
 ############################################################
 # DNS Zone Transfer Vulnerability Scanner
 # Author: Black1hp
 # For authorized security testing only
 ############################################################
 
-"""
-This script is for authorized security testing and research only.
-Unauthorized use against systems you don't own or have permission to test is illegal.
-"""
+
+import argparse
+import datetime
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import dns.resolver
+import dns.zone
+import dns.query
+import dns.exception
+from colorama import Fore, Style, init
 
 class DNSZoneTransferScanner:
-    def __init__(self, domains_file, threads, timeout, verbose, output_dir="./"):
-        self.domains_file = domains_file
+    def __init__(self, input_file, threads, timeout, verbose):
+        self.input_file = input_file
         self.threads = threads
         self.timeout = timeout
         self.verbose = verbose
-        self.output_dir = output_dir
+        self.domains = []
         self.vulnerable_domains = []
-        self.domains_queue = Queue()
-        self.lock = threading.Lock()
+        self.print_lock = threading.Lock()
+        self.file_lock = threading.Lock()
         self.total_domains = 0
         self.processed_domains = 0
 
-        # Colors for output
-        self.GREEN = "\033[92m"
-        self.RED = "\033[91m"
-        self.YELLOW = "\033[93m"
-        self.ENDC = "\033[0m"
+    def load_domains(self):
+        with open(self.input_file, 'r') as f:
+            self.domains = [line.strip() for line in f if line.strip()]
+        self.total_domains = len(self.domains)
+        if not self.domains:
+            print(f'{Fore.RED}No domains found in input file.{Style.RESET_ALL}')
+            return False
+        return True
 
-    def _load_domains(self):
-        with open(self.domains_file, 'r') as f:
-            domains = [line.strip() for line in f if line.strip()]
-        self.total_domains = len(domains)
-        for domain in domains:
-            self.domains_queue.put(domain)
+    def scan_domain(self, domain, index):
+        with self.print_lock:
+            print(f'[{index}/{self.total_domains}] Testing {domain}')
+            self.processed_domains += 1
 
-    def _resolve_ns(self, domain):
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = self.timeout
+        resolver.lifetime = self.timeout
+
         try:
-            ns_records = dns.resolver.resolve(domain, 'NS')
-            ns_list = [str(ns.target).rstrip('.') for ns in ns_records]
+            ns_answers = resolver.resolve(domain, 'NS')
+            ns_servers = [str(rdata.target).rstrip('.') for rdata in ns_answers]
             if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Found NS records for {domain}: {ns_list}")
-            return ns_list
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout) as e:
+                with self.print_lock:
+                    print(f'{Fore.YELLOW}[INFO] {domain}: Found NS records: {ns_servers}{Style.RESET_ALL}')
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout, dns.resolver.NoRootServers, Exception) as e:
             if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Could not resolve NS for {domain}: {e}")
-            return []
-        except Exception as e:
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] An unexpected error occurred resolving NS for {domain}: {e}")
-            return []
+                with self.print_lock:
+                    print(f'{Fore.YELLOW}[WARN] {domain}: Failed to resolve NS records - {str(e)}{Style.RESET_ALL}')
+            with self.print_lock:
+                print(f'{Fore.RED}[SAFE] {domain}{Style.RESET_ALL}')
+            return
 
-    def _attempt_axfr(self, domain, ns_server):
-        try:
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Attempting AXFR for {domain} on {ns_server}")
-            
-            # Try to perform zone transfer
-            zone_data_iterator = dns.query.xfr(ns_server, domain, timeout=self.timeout)
-            zone = dns.zone.from_xfr(zone_data_iterator)
-            
-            # Check if the zone actually contains records beyond just the SOA record
-            if len(zone.nodes) > 1: 
-                if self.verbose:
-                    with self.lock:
-                        print(f"[DEBUG] AXFR successful for {domain} on {ns_server} with {len(zone.nodes)} records.")
-                return zone
-            else:
-                if self.verbose:
-                    with self.lock:
-                        print(f"[DEBUG] AXFR for {domain} on {ns_server} returned only SOA record or no records (not vulnerable).")
-                return None
-            
-        except dns.exception.FormError as e:
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Form error (partial transfer/malformed response) for {domain} from {ns_server}: {e}")
-            return None
-            
-        except dns.query.TransferError as e:
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Transfer error for {domain} on {ns_server}: {e}")
-            return None
-            
-        except (dns.exception.Timeout, ConnectionRefusedError, OSError) as e:
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Connection/timeout error for {domain} on {ns_server}: {e}")
-            return None
-            
-        except dns.exception.DNSException as e: # Catch broader DNS exceptions
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] DNS Exception during AXFR for {domain} on {ns_server}: {type(e).__name__}: {e}")
-            return None
-            
-        except Exception as e:
-            if self.verbose:
-                with self.lock:
-                    print(f"[DEBUG] Unexpected error during AXFR for {domain} on {ns_server}: {type(e).__name__}: {e}")
-            return None
+        vulnerable = False
+        vuln_ns = None
+        zone_data = None
 
-    def _worker(self):
-        while not self.domains_queue.empty():
+        for ns in ns_servers:
             try:
-                domain = self.domains_queue.get_nowait()
-            except:
-                break
-                
-            ns_servers = self._resolve_ns(domain)
-            is_vulnerable = False
-            vulnerable_ns = "N/A"
+                ns_ip_answers = resolver.resolve(ns, 'A')
+                ns_ip = str(ns_ip_answers[0])
+                if self.verbose:
+                    with self.print_lock:
+                        print(f'{Fore.YELLOW}[INFO] {domain}: Resolved {ns} to {ns_ip}{Style.RESET_ALL}')
 
-            with self.lock:
-                self.processed_domains += 1
-                print(f"\r[{self.processed_domains}/{self.total_domains}] Testing {domain}...", end="", flush=True)
+                xfr = dns.query.xfr(ns_ip, domain, timeout=self.timeout)
+                zone = dns.zone.from_xfr(xfr)
 
-            if not ns_servers:
-                with self.lock:
-                    spaces = " " * 30
-                    print(f"\r[{self.processed_domains}/{self.total_domains}] {self.RED}[SAFE]{self.ENDC} {domain} (No NS records){spaces}")
-                self.domains_queue.task_done()
-                continue
+                # Validate full transfer: Check if more than just SOA (avoid false positives)
+                if len(zone.nodes) > 1:
+                    vulnerable = True
+                    vuln_ns = ns
+                    zone_data = str(zone)
+                    if self.verbose:
+                        with self.print_lock:
+                            print(f'{Fore.GREEN}[INFO] {domain}: Full AXFR succeeded on {ns} with {len(zone.nodes)} records{Style.RESET_ALL}')
+                    break
+                else:
+                    if self.verbose:
+                        with self.print_lock:
+                            print(f'{Fore.YELLOW}[INFO] {domain}: AXFR returned only SOA or empty on {ns}{Style.RESET_ALL}')
 
-            for ns_server in ns_servers:
-                zone_data = self._attempt_axfr(domain, ns_server)
-                if zone_data:
-                    is_vulnerable = True
-                    vulnerable_ns = ns_server
-                    with self.lock:
-                        spaces = " " * 30
-                        print(f"\r[{self.processed_domains}/{self.total_domains}] {self.GREEN}[VULN]{self.ENDC} {domain} — via {vulnerable_ns}{spaces}")
-                        self.vulnerable_domains.append(f"{domain} | {vulnerable_ns} | {datetime.now().isoformat()}")
-                        
-                        # Create zone_data folder and save raw zone data
-                        zone_data_folder = os.path.join(self.output_dir, "zone_data")
-                        os.makedirs(zone_data_folder, exist_ok=True)
-                        zone_file_path = os.path.join(zone_data_folder, f"{domain}.txt")
-                        with open(zone_file_path, 'w') as f:
-                            f.write(str(zone_data))
-                    break  # Found vulnerable NS, skip remaining for this domain
+            except (dns.query.TransferError, dns.exception.FormError, dns.exception.Timeout, dns.query.BadResponse, dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException, ConnectionRefusedError, OSError, Exception) as e:
+                if self.verbose:
+                    with self.print_lock:
+                        print(f'{Fore.YELLOW}[INFO] {domain}: AXFR failed (possibly partial, refused, or error) on {ns} - {type(e).__name__}: {str(e)}{Style.RESET_ALL}')
 
-            if not is_vulnerable:
-                with self.lock:
-                    spaces = " " * 30
-                    print(f"\r[{self.processed_domains}/{self.total_domains}] {self.RED}[SAFE]{self.ENDC} {domain}{spaces}")
-            
-            self.domains_queue.task_done()
-
-    def scan(self):
-        print("############################################################")
-        print("# DNS Zone Transfer Vulnerability Scanner")
-        print("# Author: Black1hp")
-        print("# For authorized security testing only")
-        print("############################################################\n")
-
-        self._load_domains()
-
-        threads = []
-        for _ in range(self.threads):
-            t = threading.Thread(target=self._worker)
-            t.daemon = True
-            threads.append(t)
-            t.start()
-
-        # Wait for all threads to complete
-        for t in threads:
-            t.join()
-
-        print("\n")  # Move to a new line after progress updates
-
-        if self.vulnerable_domains:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = os.path.join(self.output_dir, f"vulnerable_domains_{timestamp}.txt")
-            with open(output_filename, 'w') as f:
-                for entry in self.vulnerable_domains:
-                    f.write(entry + "\n")
-            print(f"Scan complete. Vulnerable domains found: {len(self.vulnerable_domains)}. Details saved to {output_filename}")
+        if vulnerable:
+            with self.print_lock:
+                print(f'{Fore.GREEN}[VULN] {domain} — via {vuln_ns}{Style.RESET_ALL}')
+            timestamp = datetime.datetime.now().isoformat()
+            log_line = f'{domain} | {vuln_ns} | {timestamp}\n'
+            self.vulnerable_domains.append(log_line)
+            # Save zone data
+            zone_data_dir = 'zone_data'
+            os.makedirs(zone_data_dir, exist_ok=True)
+            zone_file = os.path.join(zone_data_dir, f'{domain}.txt')
+            with open(zone_file, 'w') as zf:
+                zf.write(zone_data)
         else:
-            print("Scan complete. No vulnerable domains found.")
+            with self.print_lock:
+                print(f'{Fore.RED}[SAFE] {domain}{Style.RESET_ALL}')
+
+    def run(self):
+        if not self.load_domains():
+            return
+
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f'vulnerable_domains_{timestamp}.txt'
+
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = []
+            for i, domain in enumerate(self.domains, 1):
+                futures.append(executor.submit(self.scan_domain, domain, i))
+
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    if self.verbose:
+                        with self.print_lock:
+                            print(f'{Fore.RED}[ERROR] Unexpected error: {str(e)}{Style.RESET_ALL}')
+
+        # Write vulnerable domains to file (thread-safe, but done after all scans)
+        if self.vulnerable_domains:
+            with open(output_file, 'w') as f:
+                f.writelines(self.vulnerable_domains)
+            print(f'\n{Fore.GREEN}Scan complete. Vulnerable domains found: {len(self.vulnerable_domains)}. Details saved to {output_file}{Style.RESET_ALL}')
+        else:
+            print(f'\n{Fore.YELLOW}Scan complete. No vulnerable domains found.{Style.RESET_ALL}')
 
 def main():
-    parser = argparse.ArgumentParser(description="DNS Zone Transfer Vulnerability Scanner")
-    parser.add_argument("domains_file", help="File containing a list of root domains (one per line).")
-    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads for parallel scanning.")
-    parser.add_argument("--timeout", type=int, default=5, help="Timeout in seconds for each DNS query.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print all debug info, including refused NS servers.")
-    
+    init(autoreset=True)
+
+    print("""############################################################
+# DNS Zone Transfer Vulnerability Scanner
+# Author: Black1hp
+# For authorized security testing only
+############################################################""")
+
+    parser = argparse.ArgumentParser(description='DNS Zone Transfer Vulnerability Scanner')
+    parser.add_argument('input_file', help='File containing list of domains (one per line)')
+    parser.add_argument('-t', '--threads', type=int, default=20, help='Number of threads for parallel scanning')
+    parser.add_argument('--timeout', type=int, default=10, help='Timeout for each DNS query in seconds')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     args = parser.parse_args()
 
-    scanner = DNSZoneTransferScanner(args.domains_file, args.threads, args.timeout, args.verbose)
-    scanner.scan()
+    scanner = DNSZoneTransferScanner(args.input_file, args.threads, args.timeout, args.verbose)
+    scanner.run()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
